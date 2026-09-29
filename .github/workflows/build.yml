@@ -1,0 +1,192 @@
+name: Build test package (Windows)
+
+# Holds no source code. The source is checked out at run time from the
+# repository named in secret SOURCE_REPO with a read-only token (SOURCE_TOKEN);
+# the runner is discarded afterwards. Test builds only, published as pre-releases.
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: "Source branch / tag / commit to build"
+        required: true
+        default: "fix/win10-ui-icons-20260929"
+      prebuilt_ref:
+        description: "Source branch holding the prebuilt core module"
+        required: true
+        default: "ci/prebuilt-auth-20260827"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - name: Check out private source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ secrets.SOURCE_REPO }}
+          ref: ${{ inputs.source_ref }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+          persist-credentials: false
+      - name: Check out prebuilt auth core
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ secrets.SOURCE_REPO }}
+          ref: ${{ inputs.prebuilt_ref }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+          persist-credentials: false
+          path: _prebuilt
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install all dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller certifi fonttools
+          pip install PySide6 pynput keyboard pyclip requests pyaudio sounddevice httpx openai numpy pypinyin srt pystray Pillow colorama watchdog markdown tkhtmlview markdown-it-py typer shellingham click Pygments mdurl typing_extensions
+          pip install sherpa-onnx==1.12.20 -f https://k2-fsa.github.io/sherpa/onnx/cpu.html
+          pip install onnxruntime rich websockets typeguard==2.13.3 kaldi-native-fbank gguf
+      - name: Run regression tests
+        run: |
+          python -m unittest discover -s tests -p "test_*.py"
+          if ($LASTEXITCODE -ne 0) { throw "unittest discover failed ($LASTEXITCODE)" }
+          python tests/test_module_system.py
+          if ($LASTEXITCODE -ne 0) { throw "test_module_system failed ($LASTEXITCODE)" }
+      - name: Install prebuilt auth core
+        run: |
+          $pyd = "_prebuilt\prebuilt\wonderx_auth.pyd"
+          if (!(Test-Path $pyd)) { throw "prebuilt auth core missing: $pyd" }
+          Copy-Item $pyd "wonderx_voice\wonderx_auth.pyd" -Force
+          Copy-Item $pyd "wonderx_auth.pyd" -Force
+          Remove-Item "_prebuilt" -Recurse -Force
+          python -c "import wonderx_voice.wonderx_auth as m; print('auth core OK:', hasattr(m,'verify_signature'))"
+          if ($LASTEXITCODE -ne 0) { throw "auth core does not import" }
+      - name: Stamp package version
+        run: |
+          $manifest = Get-Content "version.json" -Raw | ConvertFrom-Json
+          $ver = [string]$manifest.app_version
+          if ([string]::IsNullOrWhiteSpace($ver)) { throw "version.json has no app_version" }
+          $manifest | Add-Member -NotePropertyName published_at -NotePropertyValue (Get-Date -Format "yyyy-MM-dd") -Force
+          $manifest | ConvertTo-Json -Depth 10 | Set-Content "version.json" -Encoding utf8
+          $src = (git rev-parse --short HEAD).Trim()
+          "PACKAGE_VERSION=$ver" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "RELEASE_TAG=test-${{ github.run_number }}-$src" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "SOURCE_SHA=$src" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Write-Host "Package version: $ver  source: $src"
+      - name: Build GUI client
+        run: python -m PyInstaller WonderXVoice-Windows.spec --noconfirm
+      - name: Build Server service
+        run: python -m PyInstaller WonderXVoice-Server.spec --noconfirm
+      - name: Normalize and merge
+        run: |
+          $guiDir = "dist\WonderX Voice"
+          if (!(Test-Path $guiDir)) {
+            $legacy = "dist\WonderXVoice"
+            if (Test-Path $legacy) {
+              Rename-Item $legacy "WonderX Voice"
+              $oldExe = "$guiDir\WonderXVoice.exe"
+              if (Test-Path $oldExe) { Rename-Item $oldExe "WonderX Voice.exe" }
+            }
+          }
+          if (!(Test-Path $guiDir)) { Write-Error "GUI dist not found!"; exit 1 }
+          $srvDir = $null
+          foreach ($name in @("dist\WonderX Voice Service", "dist\WonderXVoice-Service")) {
+            if (Test-Path $name) { $srvDir = $name; break }
+          }
+          if (!$srvDir) { Write-Error "Server dist not found!"; exit 1 }
+          $srvExe = Get-ChildItem $srvDir -Filter "*.exe" | Select-Object -First 1
+          if ($srvExe) { Copy-Item $srvExe.FullName "$guiDir\WonderX Voice Service.exe" -Force }
+          $srvInternal = Join-Path $srvDir "_internal"
+          $guiInternal = Join-Path $guiDir "_internal"
+          if (Test-Path $srvInternal) {
+            if (!(Test-Path $guiInternal)) { New-Item -ItemType Directory $guiInternal | Out-Null }
+            Copy-Item "$srvInternal\*" $guiInternal -Recurse -Force
+          }
+          foreach ($f in @("hot.txt","hot-rule.txt","hot-rectify.txt","hot-server.txt","version.json","purchase.safe.html","purchase.html.remote","purchase-business-contact.js")) {
+            if (Test-Path $f) { Copy-Item $f "$guiDir\$f" -Force }
+          }
+          $ok = $true
+          foreach ($must in @("WonderX Voice.exe", "WonderX Voice Service.exe", "_internal")) {
+            if (!(Test-Path (Join-Path $guiDir $must))) { Write-Host "MISSING: $must"; $ok = $false }
+          }
+          if (!$ok) { Write-Error "Required files missing!"; exit 1 }
+      - name: Verify package dependency closure
+        run: |
+          $guiDir = "dist\WonderX Voice"
+          python scripts/build/verify_package_deps.py "$guiDir" --forbid-trimmed --json package_deps.json
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::error::a trimmed library is still linked against; restore it in WonderXVoice-Windows.spec"
+            exit 1
+          }
+      - name: Install Inno Setup
+        run: choco install innosetup -y --no-progress
+      - name: Build installer EXE
+        run: |
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          $guiDir = Resolve-Path "dist\WonderX Voice"
+          $ver = $env:PACKAGE_VERSION
+          $parts = @($ver -split '\.' | Where-Object { $_ -match '^\d+$' })
+          while ($parts.Count -lt 4) { $parts += "0" }
+          $peVer = ($parts[0..3] -join '.')
+          & $iscc /DAppVersion=$ver /DPEVersion=$peVer /DBuildDir="$guiDir" /DOutputDir="Output" WonderXVoice-Setup.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed with exit code $LASTEXITCODE" }
+          if (-not (Test-Path "Output\WonderX_Voice_Setup_v$ver.exe")) { throw "expected Output\WonderX_Voice_Setup_v$ver.exe" }
+      - name: Build shell installer
+        run: |
+          $ver = $env:PACKAGE_VERSION
+          New-Item -ItemType Directory -Force "build\installer_repack\1.0.0_slim" | Out-Null
+          $innoExe = Get-ChildItem "Output\*.exe" | Select-Object -First 1
+          Copy-Item $innoExe.FullName "build\installer_repack\1.0.0_slim\WonderX_Voice_Setup_v1.0.0.exe" -Force
+          python -m PyInstaller InstallerShell-1.0.0-slim.spec --noconfirm
+          $shell = Get-ChildItem "dist\WonderX_Voice_Setup_*shell*" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $shell) { Write-Error "Shell installer not found!"; exit 1 }
+          Copy-Item $shell.FullName "Output\WonderX_Voice_v$ver.exe" -Force
+      - name: Install smoke test
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $setup = Get-ChildItem "Output\WonderX_Voice_Setup_*.exe" | Where-Object { $_.Name -notmatch "shell" } | Select-Object -First 1
+          $installDir = Join-Path $env:LOCALAPPDATA "Programs\WonderX Voice Smoke"
+          $logFile = Join-Path $env:RUNNER_TEMP "inno-smoke.log"
+          $argLine = '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP- /LOG="{0}" /DIR="{1}"' -f $logFile, $installDir
+          $proc = Start-Process -FilePath $setup.FullName -ArgumentList $argLine -PassThru
+          Wait-Process -Id $proc.Id -Timeout 300 -ErrorAction SilentlyContinue
+          if (-not $proc.HasExited) { Stop-Process -Id $proc.Id -Force; throw "Installer did not exit within 300 seconds" }
+          if ($proc.ExitCode -ne 0) { throw "Installer exited with code $($proc.ExitCode)" }
+          $appExe = Join-Path $installDir "WonderX Voice.exe"
+          if (-not (Test-Path $appExe)) { throw "'$appExe' is missing after install" }
+          $p = Start-Process -FilePath $appExe -PassThru
+          Start-Sleep -Seconds 20
+          if ($p.HasExited -and $p.ExitCode -ne 0) { throw "App exited with code $($p.ExitCode)" }
+          $moduleErrors = Get-ChildItem $installDir -Recurse -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match "log|txt" } |
+            ForEach-Object { Select-String -Path $_.FullName -Pattern "No module named", "ModuleNotFoundError" -SimpleMatch -ErrorAction SilentlyContinue }
+          if ($moduleErrors) {
+            $moduleErrors | ForEach-Object { Write-Host "$($_.Filename):$($_.LineNumber): $($_.Line)" }
+            throw "Smoke test found module import errors in logs."
+          }
+          if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }
+          Write-Host "Smoke test passed."
+      - name: Name release asset
+        run: |
+          $pkg = Get-ChildItem "Output\WonderX_Voice_v*.exe" | Select-Object -First 1
+          if (-not $pkg) { throw "packaged installer not found in Output" }
+          Copy-Item $pkg.FullName "Output\setup-${{ env.SOURCE_SHA }}.exe" -Force
+      - name: Publish test pre-release
+        if: success()
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: Test build ${{ env.PACKAGE_VERSION }} (${{ env.SOURCE_SHA }})
+          body: |
+            Test build of `${{ inputs.source_ref }}` at `${{ env.SOURCE_SHA }}`.
+            Not an official release.
+          files: |
+            Output/setup-${{ env.SOURCE_SHA }}.exe
+          draft: false
+          prerelease: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
